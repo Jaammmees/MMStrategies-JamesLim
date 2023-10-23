@@ -1,0 +1,325 @@
+from AlgorithmImports import *
+
+#THIS ONE IS UNFINISHED, IT DOES NOT CORRECTLY RECORD PROFIT AS QUANTCONNECT CURRENTLY DOES NOT SUPPORT BUYING ON "X" MARKET AND SELLING THE "SAME" ASSET ON "Y" MARKET
+#FOR EXAMPLE, IF YOU BUY BTCUSDT ON BINANCE, THAT COUNTS AS BINANCEBTCUSDT AND WILL ONLY BE SOLD OR BOUGHT ON BINANCE, VICE VERSA FOR KRAKEN.
+#THEREFORE ATTEMPTS TO RECORD PROFIT MANUALLY AND PLOT THAT ON A GRAPH BUT IS CURRENTLY STILL UNFINISHED.
+
+class HipsterRedCrocodile(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2022, 6, 15)
+        self.SetEndDate(2022, 7, 30)
+        self.InitCash = 1000000
+        self.SetCash(self.InitCash)
+        self.binance_symbols = [self.AddCrypto(ticker, Resolution.Minute, Market.Binance).Symbol for ticker in ["BTCUSDT"]]
+        self.kraken_symbols = [self.AddCrypto(ticker, Resolution.Minute, Market.Kraken).Symbol for ticker in ["BTCUSDT"]]
+        self.symbols = self.binance_symbols + self.kraken_symbols  #symbols[0] binance #symbols[1] kraken
+        self.btcusd = []
+        self.is_trading_paused = False
+
+        #MM parameters
+        self.max_inventory_size = 10
+        self.reduction_factor = 0.5
+        self.bid_spread = float(self.GetParameter("bid_spread"))
+        self.ask_spread = float(self.GetParameter("ask_spread"))
+        self.lot_size = float(self.GetParameter("lot_size"))
+        self.order_refresh_time = int(self.GetParameter("order_refresh_time"))
+        self.stop_loss_percentage = int(self.GetParameter("stop_loss_percentage"))
+        self.last_arbitrage_time = datetime.min
+        self.last_arbitrage_opportunity = None
+        
+        #stats and stuff
+        self.last_filled_prices = {}  
+        self.last_buy_prices = {symbol: 0 for symbol in self.symbols}
+        self.last_sell_prices = {symbol: 0 for symbol in self.symbols}
+        self.daily_profit_loss = {symbol: 0 for symbol in self.symbols}
+        self.entry_prices = {symbol: 0 for symbol in self.symbols}
+        self.AddChart(Chart("Custom Profit"))
+        self.total_arbitrage_profit = 0
+        self.buy_prices = {'BTCUSDT': None}
+        self.sell_prices = {'BTCUSDT': None}
+
+
+        
+        #cancels orders n stuff
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(TimeSpan.FromSeconds(self.order_refresh_time)), Action(self.cancel_all_orders))
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 0), Action(self.reset_daily_values))
+
+    def OnData(self, data):
+        if self.is_trading_paused:
+            return
+        proposal, arbitrage_opportunity = self.create_proposal(data)  # Unpack correctly
+
+        binance_close = data[self.symbols[0]].Close if self.symbols[0] in data else None
+        kraken_close = data[self.symbols[1]].Close if self.symbols[1] in data else None
+
+        if binance_close is not None and kraken_close is not None:
+            self.Plot("Binance and Kraken BTCUSDT Prices", "Binance Price", binance_close)
+            self.Plot("Binance and Kraken BTCUSDT Prices", "Kraken Price", kraken_close)
+    
+        #self.place_orders_separate_processes(proposal, arbitrage_opportunity)
+        self.place_orders_hybrid_strategy(proposal, arbitrage_opportunity)
+        #self.execute_arbitrage(arbitrage_opportunity)
+        self.check_and_rebalance_inventory()
+        self.check_stop_loss()
+
+    #main logic =============================================================
+    #inter-market proposal
+    def create_proposal(self, data) -> list:
+        proposal = []
+        ref_prices = {}
+        
+        for symbol in self.symbols:
+            ref_price = (self.Securities[symbol].BidPrice + self.Securities[symbol].AskPrice) / 2
+            ref_prices[symbol] = ref_price
+
+            inventory_score = self.calculate_inventory_score(symbol) 
+            buy_price = ref_price * (1 - self.bid_spread)
+            sell_price = ref_price * (1 + self.ask_spread)
+            proposal.append((symbol, buy_price, sell_price, inventory_score))
+
+        arbitrage_opportunity = None
+        if ref_prices[self.symbols[0]] < ref_prices[self.symbols[1]]:
+            arbitrage_opportunity = ("buy", self.symbols[0], "sell", self.symbols[1])
+        elif ref_prices[self.symbols[0]] > ref_prices[self.symbols[1]]:
+            arbitrage_opportunity = ("sell", self.symbols[0], "buy", self.symbols[1])
+
+        return proposal, arbitrage_opportunity
+
+    def place_orders_separate_processes(self, proposal, arbitrage_opportunity):
+        # Market making logic
+        self.place_market_making_orders(proposal)
+        # Arbitrage logic
+        self.execute_arbitrage(arbitrage_opportunity)
+
+    def place_orders_hybrid_strategy(self, proposal, arbitrage_opportunity):
+        # Market making logic informed by arbitrage opportunities
+        self.place_market_making_orders_hybrid(proposal, arbitrage_opportunity)
+
+    def place_market_making_orders(self, proposal):
+        # Collect the reference prices
+        ref_prices = {}
+        for symbol in self.symbols:
+            ref_price = (self.Securities[symbol].BidPrice + self.Securities[symbol].AskPrice) / 2
+            ref_prices[symbol] = ref_price
+
+        # Market-Making logic
+        for symbol, buy_price, sell_price, inventory_score in proposal:
+            quantity = self.Portfolio[symbol].Quantity
+            
+            # Adjust buy and sell prices if inventory exceeds max size
+            if abs(quantity) >= self.max_inventory_size:
+                buy_price = buy_price * (1 - self.reduction_factor * self.bid_spread)
+                sell_price = sell_price * (1 + self.reduction_factor * self.ask_spread)
+            
+            # Adjust bid and ask quantities based on the inventory score
+            if inventory_score == 0:
+                bid_quantity = self.lot_size
+                ask_quantity = self.lot_size
+            else:
+                bid_quantity = self.lot_size * inventory_score  
+                ask_quantity = self.lot_size / inventory_score 
+
+            # Rounding for precision
+            buy_price = round(buy_price, 2)
+            sell_price = round(sell_price, 2)
+            bid_quantity = round(bid_quantity, 5)
+            ask_quantity = round(ask_quantity, 5)
+
+            # Place a bid order
+            self.LimitOrder(symbol, bid_quantity, buy_price)
+            # Place an ask order
+            self.LimitOrder(symbol, -ask_quantity, sell_price)
+
+    def execute_arbitrage(self, arbitrage_opportunity):
+        if arbitrage_opportunity:
+            self.last_arbitrage_opportunity = arbitrage_opportunity
+            actionBinance, BinanceBTCUSDT, actionKraken, KrakenBTCUSDT = arbitrage_opportunity
+            priceBinance = (self.Securities[BinanceBTCUSDT].BidPrice + self.Securities[BinanceBTCUSDT].AskPrice) / 2
+            priceKraken = (self.Securities[KrakenBTCUSDT].BidPrice + self.Securities[KrakenBTCUSDT].AskPrice) / 2
+
+            # self.Debug(f"Arbitrage Opportunity: {actionBinance} on Binance at {priceBinance}, {actionKraken} on Kraken at {priceKraken}, Price difference to capture: {abs(priceBinance - priceKraken)}")
+
+            if actionBinance == "buy":
+                self.MarketOrder(BinanceBTCUSDT, self.lot_size)
+                # self.Debug(f"Placing Market Buy Order on Binance: {priceBinance}")
+            else:
+                self.MarketOrder(BinanceBTCUSDT, -self.lot_size)
+                # self.Debug(f"Placing Market Sell Order on Binance: {priceBinance}")
+
+            if actionKraken == "buy":
+                self.MarketOrder(KrakenBTCUSDT, self.lot_size)
+                # self.Debug(f"Placing Market Buy Order on Kraken: {priceKraken}")
+            else:
+                self.MarketOrder(KrakenBTCUSDT, -self.lot_size)
+                # self.Debug(f"Placing Market Sell Order on Kraken: {priceKraken}")
+
+
+    def place_market_making_orders_hybrid(self, proposal, arbitrage_opportunity):
+
+        if arbitrage_opportunity:
+            self.last_arbitrage_opportunity = arbitrage_opportunity
+            actionBinance, BinanceBTCUSDT, actionKraken, KrakenBTCUSDT = arbitrage_opportunity
+            price1 = (self.Securities[BinanceBTCUSDT].BidPrice + self.Securities[BinanceBTCUSDT].AskPrice) / 2
+            price2 = (self.Securities[KrakenBTCUSDT].BidPrice + self.Securities[KrakenBTCUSDT].AskPrice) / 2
+
+            #self.Debug(f"Arbitrage Opportunity: {actionBinance} on Binance at {price1}, {actionKraken} on Kraken at {price2}")
+
+            for symbol, buy_price, sell_price, inventory_score in proposal:
+                #self.Debug(f"Original buy and sell prices for {symbol}: Buy at {buy_price}, Sell at {sell_price}")
+
+                if symbol == BinanceBTCUSDT and actionBinance == "buy":
+                    buy_price = price2  # set to the lower price
+
+                    #self.Debug(f"Updated buy price for {symbol}: {buy_price}")
+
+                elif symbol == KrakenBTCUSDT and actionKraken == "sell":
+                    sell_price = price1  # set to the higher price
+
+                    #self.Debug(f"Updated sell price for {symbol}: {sell_price}")
+
+                #self.Debug(f"Placing Limit Order for {symbol}: Buy at {buy_price}, Sell at {sell_price}")
+                self.LimitOrder(symbol, self.lot_size, buy_price)
+                self.LimitOrder(symbol, -self.lot_size, sell_price)
+        else:
+            for symbol, buy_price, sell_price, inventory_score in proposal:
+                self.LimitOrder(symbol, self.lot_size, buy_price)
+                self.LimitOrder(symbol, -self.lot_size, sell_price)
+
+
+    #Start of Inventory & Risk Management -------------------------------
+
+    def calculate_inventory_score(self, symbol) -> float:
+        current_quantity = self.Portfolio[symbol].Quantity
+        inventory_ratio = abs(current_quantity) / self.max_inventory_size
+
+        # Ensuring the ratio stays within [0, 1]
+        inventory_ratio = max(0, min(inventory_ratio, 1))
+
+        # Inverse logic - if you have too much inventory, the score will be lower
+        inventory_score = 1 - inventory_ratio
+        #self.Debug(f'{symbol}: Current Quantity: {current_quantity}, Inventory Ratio: {inventory_ratio}, Inventory Score: {inventory_score}')  # Debug
+        return inventory_score
+
+
+    def check_and_rebalance_inventory(self):
+        target_balance_ratio = 0.3  # 50% base, 50% quote
+        tolerance = 0.05  # Allowable deviation from the target balance ratio
+
+        for symbol in self.symbols:
+            # Current quantity of the base asset
+            base_quantity = self.Portfolio[symbol].Quantity
+            # Current value of the quote asset, converted to base asset units
+            quote_value_in_base = self.Portfolio.CashBook['USD'].Amount / (self.Securities[symbol].BidPrice + self.Securities[symbol].AskPrice) / 2
+
+            # Total value of the portfolio in base asset units
+            total_value_in_base = base_quantity + quote_value_in_base
+
+            # Current balance ratio
+            current_balance_ratio = base_quantity / total_value_in_base
+
+            # Check if rebalancing is needed
+            if abs(current_balance_ratio - target_balance_ratio) < tolerance:
+                continue
+
+            # Calculate the desired quantity of the base asset
+            target_base_quantity = total_value_in_base * target_balance_ratio
+            delta_quantity = target_base_quantity - base_quantity
+
+            # Place the order to rebalance
+            self.MarketOrder(symbol, delta_quantity)
+
+    def cancel_all_orders(self):
+        openOrders = self.Transactions.GetOpenOrders()
+        if len(openOrders) > 0:
+            for x in openOrders:
+                self.Transactions.CancelOrder(x.Id)
+
+    def check_stop_loss(self):
+        # Get the starting cash for the day
+        starting_cash_for_day = self.InitCash
+
+        # Calculate the current portfolio value
+        current_portfolio_value = self.Portfolio.TotalPortfolioValue
+
+        # Calculate the daily loss percentage
+        daily_loss_percentage = (starting_cash_for_day - current_portfolio_value) / starting_cash_for_day * 100
+
+        # Check if the daily loss exceeds the threshold 
+        if daily_loss_percentage > 2:
+            # Cancel all existing orders
+            self.cancel_all_orders()
+
+            # Set the flag to pause trading
+            self.is_trading_paused = True
+    
+    def reset_daily_values(self):
+        # Reset the trading paused flag
+        self.is_trading_paused = False
+
+        # Reset the starting cash for the day to the current portfolio value
+        self.InitCash = self.Portfolio.TotalPortfolioValue
+    #end of Inventory & Risk Management -----------------------------------
+
+    #end main logic =============================================================
+
+
+    #profit tracking stuff
+    def OnOrderEvent(self, orderEvent):
+        arbitrage_profit = 0
+        if orderEvent.Status == OrderStatus.Filled:
+            symbol = orderEvent.Symbol
+            fill_price = orderEvent.FillPrice
+            fill_quantity = orderEvent.FillQuantity
+
+                # Update buy and sell prices
+            if fill_quantity > 0:  # Buy order
+                self.buy_prices[symbol] = fill_price
+            else:  # Sell order
+                self.sell_prices[symbol] = fill_price
+
+            # Only proceed if we have both buy and sell prices for each asset on both exchanges
+            if self.buy_prices['BTCUSDT'] is not None and self.sell_prices['BTCUSDT'] is not None:
+                arbitrage_profit = (self.sell_prices['BTCUSDT'] - self.buy_prices['BTCUSDT']) * abs(fill_quantity)
+                self.total_arbitrage_profit += arbitrage_profit
+                self.Debug("Hello")
+                # Optionally, reset the prices to None if you want to wait for a new arbitrage opportunity
+                self.buy_prices['BTCUSDT'] = None
+                self.sell_prices['BTCUSDT'] = None
+
+        current_time = self.Time
+        if current_time.minute == 0:
+            self.Plot("Custom Profit", "Total Profit", self.total_arbitrage_profit)
+
+
+
+                
+    def OnEndOfDay(self):
+        # #Log the daily profit/loss for each symbol
+        # for symbol, profit_loss in self.daily_profit_loss.items():
+        #     if profit_loss > 0:
+        #         self.Debug(f"Daily Profit for {symbol}: ${profit_loss}")
+        #     elif profit_loss < 0:
+        #         self.Debug(f"Daily Loss for {symbol}: -${abs(profit_loss)}")
+        #     else:
+        #         self.Debug(f"No Daily Profit/Loss for {symbol}")
+        # self.cancel_all_orders()
+
+        # Reset daily profit/loss and last buy/sell prices for the next trading day
+        self.last_buy_prices = {symbol: 0 for symbol in self.symbols}
+        self.last_sell_prices = {symbol: 0 for symbol in self.symbols}
+        self.daily_profit_loss = {symbol: 0 for symbol in self.symbols}
+
+        #plot buy and hold strategy of btc and eth, should also show their price movement
+        btc_history = self.History(self.symbols[0], 2, Resolution.Minute)
+
+        # Extract the close price
+        btc_price = btc_history.loc[self.symbols[0]]['close'].iloc[-1]
+
+        self.btcusd.append(btc_price)
+        btc_perf = self.InitCash * self.btcusd[-1]/self.btcusd[0]
+        self.Plot('Strategy Equity', self.symbols[0], btc_perf)
+        
+        
+
+
