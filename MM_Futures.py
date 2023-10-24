@@ -76,7 +76,7 @@ class HipsterRedCrocodile(QCAlgorithm):
         ratio_mean = np.mean(self.ratio_history)
         ratio_std = np.std(self.ratio_history)
 
-        # Initialize ratio_z to None
+        # Initialise ratio_z to None
         ratio_z = None
 
         if self.Time.minute % 60 == 0:
